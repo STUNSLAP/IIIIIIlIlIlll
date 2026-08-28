@@ -29,10 +29,7 @@ public sealed class Catalog : IModelSource
     public static async Task<IReadOnlyList<ModelFamily>> FetchFamiliesAsync(CancellationToken cancel = default)
     {
         var families = await FetchCatalogFamiliesAsync(cancel);
-        if (families.Length == 0)
-            return [];
-
-        return families.Select(ToModelFamily).ToList();
+        return families.Length == 0 ? [] : families.Select(ToModelFamily).ToList();
     }
 
     /// <summary>
@@ -73,19 +70,25 @@ public sealed class Catalog : IModelSource
         Description = family.Description,
         License = family.License,
         Featured = family.Featured,
-        Sizes = family.Sizes.Select(size => new ModelFamilySize
-        {
-            Name = size.Name,
-            Params = size.Params,
-            Vision = size.Vision,
-            Builds = size.Builds.Select(build => new ModelFamilyBuild
+        Sizes =
+        [
+            .. family.Sizes.Select(size => new ModelFamilySize
             {
-                Quant = build.Quant,
-                Size = build.Size,
-                SizeBytes = build.SizeBytes,
-                Repo = build.Repo,
-            }).ToList(),
-        }).ToList(),
+                Name = size.Name,
+                Params = size.Params,
+                Vision = size.Vision,
+                Builds =
+                [
+                    .. size.Builds.Select(build => new ModelFamilyBuild
+                    {
+                        Quant = build.Quant,
+                        Size = build.Size,
+                        SizeBytes = build.SizeBytes,
+                        Repo = build.Repo,
+                    })
+                ],
+            })
+        ],
     };
 
     /// <summary>
@@ -305,9 +308,9 @@ public sealed class Catalog : IModelSource
             return string.Create(CultureInfo.InvariantCulture, $"{bytes / 1_000_000_000.0:0.#} GB");
         if (bytes >= 1_000_000)
             return string.Create(CultureInfo.InvariantCulture, $"{bytes / 1_000_000.0:0} MB");
-        if (bytes >= 1_000)
-            return string.Create(CultureInfo.InvariantCulture, $"{bytes / 1_000.0:0} KB");
-        return string.Create(CultureInfo.InvariantCulture, $"{bytes} B");
+        return bytes >= 1_000 ? 
+            string.Create(CultureInfo.InvariantCulture, $"{bytes / 1_000.0:0} KB") : 
+            string.Create(CultureInfo.InvariantCulture, $"{bytes} B");
     }
 
     // ---- JSON DTOs matching the catalog.json schema ----
