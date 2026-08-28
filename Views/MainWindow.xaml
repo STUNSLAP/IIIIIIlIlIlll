@@ -150,10 +150,23 @@
                         <StackPanel Orientation="Horizontal"
                                     Spacing="6"
                                     VerticalAlignment="Center">
-                            <!-- Quant chip: first element of the metadata
+                            <!-- Params chip: first element of the metadata
                                  line, so it starts at the same x on every
                                  row (the drift it had behind variable-length
-                                 names is what made it feel random). -->
+                                 names is what made it feel random). Same tag
+                                 style as the details view's parameter badge. -->
+                            <Border CornerRadius="{ThemeResource ControlCornerRadius}"
+                                    Background="{ThemeResource ControlFillColorSecondaryBrush}"
+                                    Padding="4,0"
+                                    Height="16"
+                                    VerticalAlignment="Center"
+                                    Visibility="{x:Bind Model.HasParameters}">
+                                <TextBlock Text="{x:Bind Model.Parameters}"
+                                           FontSize="10"
+                                           VerticalAlignment="Center"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </Border>
+                            <!-- Quant chip, right after the params chip. -->
                             <Border CornerRadius="{ThemeResource ControlCornerRadius}"
                                     Background="{ThemeResource ControlFillColorSecondaryBrush}"
                                     Padding="4,0"
@@ -196,7 +209,8 @@
                                           HorizontalAlignment="Center"
                                           VerticalAlignment="Center" />
                             </Border>
-                            <!-- Subtitle: "params · size" at rest; while a
+                            <!-- Subtitle: the file size at rest (the params
+                                 ride in the chip ahead of it); while a
                                  download runs, the live detail line instead
                                  ("3.2 GB of 12.1 GB · 45 MB/s · ~4 min left"). -->
                             <TextBlock FontSize="12"

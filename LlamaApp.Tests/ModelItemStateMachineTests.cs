@@ -321,7 +321,7 @@ public class ModelItemStateMachineTests
     }
 
     [Fact]
-    public void Paused_Subtitle_Falls_Back_To_Params_Size_When_Size_Unknown()
+    public void Paused_Subtitle_Falls_Back_To_Size_When_Size_Unknown()
     {
         // Paused before the server reported a size — no bare "Paused" marker.
         var item = new ModelItem
@@ -331,7 +331,7 @@ public class ModelItemStateMachineTests
             DownloadPaused = true,
         };
 
-        Assert.Equal("20B · 12.1 GB", item.SubtitleText);
+        Assert.Equal("12.1 GB", item.SubtitleText);
     }
 
     [Fact]
@@ -401,7 +401,7 @@ public class ModelItemStateMachineTests
         Assert.False(item.ResumeDownloadVisible);
         Assert.False(item.CancelDownloadVisible);
         Assert.False(item.PausedPercentTextVisible);
-        Assert.Equal("20B · 12.1 GB", item.SubtitleText);
+        Assert.Equal("12.1 GB", item.SubtitleText);
     }
 
     [Fact]
@@ -506,18 +506,20 @@ public class ModelItemStateMachineTests
     // ----- Download detail line / subtitle ---------------------------------
 
     [Fact]
-    public void Subtitle_Is_Params_And_Size_At_Rest()
+    public void Subtitle_Is_The_Size_At_Rest()
     {
+        // The params ride in the row's chip, not in the subtitle.
         var item = new ModelItem { Parameters = "20B", Size = "12.1 GB" };
-        Assert.Equal("20B · 12.1 GB", item.SubtitleText);
+        Assert.Equal("12.1 GB", item.SubtitleText);
     }
 
     [Fact]
-    public void Subtitle_Drops_Empty_Parts()
+    public void Subtitle_Is_Empty_When_The_Size_Is_Unknown()
     {
-        // An uncataloged model can lack params/size — no dangling " · ".
-        var item = new ModelItem { Parameters = "", Size = "12.1 GB" };
-        Assert.Equal("12.1 GB", item.SubtitleText);
+        // An uncataloged model can lack a size — an empty subtitle, no
+        // dangling separator.
+        var item = new ModelItem { Parameters = "20B", Size = "" };
+        Assert.Equal(string.Empty, item.SubtitleText);
     }
 
     [Fact]
@@ -550,11 +552,11 @@ public class ModelItemStateMachineTests
 
         // Size unknown yet → the rest subtitle stays (no "0 B of 0 B").
         var early = new ModelItem { Parameters = "20B", Size = "12.1 GB", IsDownloading = true };
-        Assert.Equal("20B · 12.1 GB", early.SubtitleText);
+        Assert.Equal("12.1 GB", early.SubtitleText);
     }
 
     [Fact]
-    public void Subtitle_Returns_To_Params_Size_When_Download_Ends()
+    public void Subtitle_Returns_To_Size_When_Download_Ends()
     {
         var item = new ModelItem
         {
@@ -566,7 +568,7 @@ public class ModelItemStateMachineTests
         };
 
         item.IsDownloading = false;
-        Assert.Equal("20B · 12.1 GB", item.SubtitleText);
+        Assert.Equal("12.1 GB", item.SubtitleText);
     }
 
     [Fact]

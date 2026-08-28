@@ -127,7 +127,7 @@ public sealed class Catalog : IModelSource
     /// unit tests.
     /// </summary>
     internal static List<Repository> Flatten(CatalogFamily[] families)
-        => Flatten(families.Select(ToModelFamily).ToList());
+        => Flatten([.. families.Select(ToModelFamily)]);
 
     // ---- IModelSource ----
 
@@ -135,7 +135,7 @@ public sealed class Catalog : IModelSource
     public async Task<ICollection<T>> GetModelsAsync<T>() where T : IModel
     {
         var repos = await FetchAsync();
-        return repos.Cast<T>().ToList();
+        return [.. repos.Cast<T>()];
     }
 
     /// <summary>
@@ -149,7 +149,7 @@ public sealed class Catalog : IModelSource
         var repos = await FetchLocalAsync(
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface", "hub")
         );
-        return repos.Cast<T>().ToList();
+        return [.. repos.Cast<T>()];
     }
 
     /// <summary>
@@ -211,8 +211,7 @@ public sealed class Catalog : IModelSource
                     var fileName = Path.GetFileNameWithoutExtension(ggufFile);
 
                     // Match against the remote catalog by repo id for metadata.
-                    if (catalogLookup != null &&
-                        catalogLookup.TryGetValue(repoId, out var matched))
+                    if (catalogLookup != null && catalogLookup.TryGetValue(repoId, out var matched))
                     {
                         results.Add(new Repository
                         {
@@ -283,7 +282,8 @@ public sealed class Catalog : IModelSource
     {
         var parts = fileName.Split('-');
         return parts.Select(p => p.Trim()).FirstOrDefault(
-            trimmed => trimmed.Length > 1 && (trimmed[0] == 'Q' || trimmed.StartsWith("mxfp", StringComparison.OrdinalIgnoreCase))
+            trimmed => trimmed.Length > 1 && 
+            (trimmed[0] == 'Q' ||  trimmed.StartsWith("mxfp", StringComparison.OrdinalIgnoreCase))
         );
     }
 

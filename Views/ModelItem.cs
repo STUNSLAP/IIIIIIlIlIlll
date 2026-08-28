@@ -104,6 +104,9 @@ public sealed class ModelItem : IModel, INotifyPropertyChanged
     /// <summary>True when a quant label exists — drives the row's quant chip.</summary>
     public bool HasQuant => !string.IsNullOrWhiteSpace(Quant);
 
+    /// <summary>True when a parameter count exists — drives the row's params chip.</summary>
+    public bool HasParameters => !string.IsNullOrWhiteSpace(Parameters);
+
     /// <summary>
     /// The row's tooltip: the full (possibly ellipsized) name, the catalog's
     /// one-line <see cref="Description"/> on a second line when known — so
@@ -585,15 +588,15 @@ public sealed class ModelItem : IModel, INotifyPropertyChanged
     /// <summary>
     /// The row's subtitle line: while a download with a known size runs, the
     /// live progress detail (<see cref="DownloadDetailText"/>); while paused,
-    /// a "Paused" marker; otherwise the catalog's "params · size" pair
-    /// (empty parts dropped).
+    /// a "Paused" marker; otherwise the model's file <see cref="Size"/> alone
+    /// — the parameter count rides in the chip ahead of it (same tag as the
+    /// details view's parameter badge), so it isn't repeated here.
     /// </summary>
     public string SubtitleText => IsDownloading && DownloadTotalBytes > 0
         ? DownloadDetailText
         : DownloadPaused && DownloadTotalBytes > 0
             ? DownloadProgressPresentation.FormatPausedDetail()
-            : string.Join(" · ", new[] { Parameters, Size }
-                .Where(s => !string.IsNullOrWhiteSpace(s)));
+            : Size;
 
     // ---- Row state signals ----
     // The running state is a green badge pinned to the logo tile; every other
