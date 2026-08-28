@@ -1137,8 +1137,12 @@ public sealed class LlamaManager
     /// <c>download_failed</c> event arrives for the model.</item>
     /// </list></para>
     /// </summary>
-    /// <param name="model">The model to download; <see cref="IModel.Name"/> is
-    /// the Hugging Face repo id (e.g. <c>ggml-org/gpt-oss-20b-GGUF</c>).</param>
+    /// <param name="model">The model to download; <see cref="IModel.ServerModelId"/>
+    /// is the Hugging Face repo id with its <c>:&lt;quant&gt;</c> suffix (e.g.
+    /// <c>ggml-org/gpt-oss-20b-GGUF:Q4_0</c>). The quant suffix is what tells
+    /// the server which GGUF variant to fetch — a bare repo id leaves the
+    /// choice to the server's own default resolution, which can download a
+    /// different (typically larger) quant than the one the user picked.</param>
     /// <param name="progress">Receives <see cref="ModelDownloadProgress"/> updates
     /// as the server streams them. May be <c>null</c>.</param>
     /// <param name="cancel">Cancels the download (closes the SSE stream and
@@ -1156,7 +1160,11 @@ public sealed class LlamaManager
             return false;
         }
 
-        var modelName = model.Name;
+        // The canonical repo:quant id — the quant suffix pins the exact GGUF
+        // variant the user picked; POSTing a bare repo id lets the server
+        // resolve its own default quant (observed: Q4_0 requested, Q8_0 landed
+        // in the cache).
+        var modelName = model.ServerModelId;
 
         // Open the SSE stream first so we don't miss the earliest progress events.
         // HttpCompletionOption.ResponseHeadersRead lets us read the body as it
@@ -1225,7 +1233,11 @@ public sealed class LlamaManager
             await foreach (var (evt, modelId, data) in ParseSseStreamAsync(reader, sseCts.Token))
             {
                 cancel.ThrowIfCancellationRequested();
-                if (!string.Equals(modelId, modelName, StringComparison.OrdinalIgnoreCase) && modelId != "*")
+                // The SSE "model" field may carry the bare repo or the
+                // repo:quant form depending on the server build and how the
+                // download was started — match on the repo part so neither
+                // form is missed for this download.
+                if (!SameDownloadModel(modelId, modelName))
                     continue; // another model's event
 
                 switch (evt)
@@ -1283,9 +1295,11 @@ public sealed class LlamaManager
     /// leaves the <c>downloading</c> state, so a quiet stream (a stalled but
     /// living download) is waited out rather than second-guessed.</para>
     /// </summary>
-    /// <param name="repoName">The bare Hugging Face repo id the server puts in
-    /// the SSE <c>model</c> field while downloading (e.g.
-    /// <c>ggml-org/gemma-3-4b-it-GGUF</c>).</param>
+    /// <param name="repoName">The server model id of the download to watch —
+    /// the Hugging Face repo id as the server keys it, bare
+    /// (<c>ggml-org/gemma-3-4b-it-GGUF</c>) or with its quant suffix
+    /// (<c>…GGUF:Q4_0</c>). Either form works: SSE events are matched on the
+    /// repo part (see <see cref="SameDownloadModel"/>).</param>
     /// <param name="progress">Receives <see cref="ModelDownloadProgress"/> updates
     /// as the server streams them. May be <c>null</c>.</param>
     /// <param name="cancel">Stops the watch (does not affect the download).</param>
@@ -1312,7 +1326,12 @@ public sealed class LlamaManager
             using var reader = new StreamReader(await sseResponse.Content.ReadAsStreamAsync(cancel));
             await foreach (var (evt, modelId, data) in ParseSseStreamAsync(reader, cancel))
             {
-                if (!string.Equals(modelId, repoName, StringComparison.OrdinalIgnoreCase))
+                // Match on the repo part: the SSE "model" field may or may not
+                // carry the quant suffix depending on how (and by whom) the
+                // download was started — an exact compare of the bare repo id
+                // misses repo:quant events and leaves the row on an
+                // indeterminate ring for the whole download.
+                if (!SameDownloadModel(modelId, repoName))
                     continue; // another model's event ("*" broadcasts carry no progress)
 
                 switch (evt)
@@ -1970,6 +1989,23 @@ public sealed class LlamaManager
     }
 
     /// <summary>
+    /// Whether an SSE event's <c>model</c> field belongs to the download
+    /// identified by <paramref name="wantedId"/>: exact match, a <c>*</c>
+    /// broadcast, or the same repo part — the server ids a model by its bare
+    /// repo while the download is in flight (the quant resolves only on
+    /// completion), while <paramref name="wantedId"/> is the repo:quant form
+    /// the download was started with.
+    /// </summary>
+    internal static bool SameDownloadModel(string eventId, string wantedId)
+    {
+        if (eventId == "*") return true;
+        if (string.Equals(eventId, wantedId, StringComparison.OrdinalIgnoreCase)) return true;
+        var eventRepo = eventId.Split(':')[0];
+        var wantedRepo = wantedId.Split(':')[0];
+        return string.Equals(eventRepo, wantedRepo, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// Asks the server to cancel an in-flight download via
     /// <c>POST /models/unload</c>. Best-effort — the server may have already
     /// finished or the request may fail; either way the SSE stream is closed
@@ -1990,12 +2026,29 @@ public sealed class LlamaManager
     {
         try
         {
-            var payload = $$"""{"model":"{{modelName}}"}""";
-            using var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            using var budget = WithTimeout(TimeSpan.FromSeconds(10), CancellationToken.None);
-            using var resp = await _http.PostAsync("/models/unload", content, budget.Token);
+            // Downloads are keyed by the id they were started with
+            // (repo:quant), but the server may also know the entry by its
+            // bare repo while the download is in flight — try the full id
+            // first, then the bare repo when that misses.
+            if (await TryUnloadAsync(modelName)) return;
+            var repo = modelName.Split(':')[0];
+            if (!string.Equals(repo, modelName, StringComparison.Ordinal))
+                await TryUnloadAsync(repo);
         }
         catch { /* Best-effort — don't surface cancel cleanup failures. */ }
+
+        async Task<bool> TryUnloadAsync(string id)
+        {
+            try
+            {
+                var payload = $$"""{"model":"{{id}}"}""";
+                using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                using var budget = WithTimeout(TimeSpan.FromSeconds(10), CancellationToken.None);
+                using var resp = await _http.PostAsync("/models/unload", content, budget.Token);
+                return resp.IsSuccessStatusCode;
+            }
+            catch { return false; }
+        }
     }
 
     // ---- Resolution ----

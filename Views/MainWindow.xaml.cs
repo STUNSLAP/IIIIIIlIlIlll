@@ -342,13 +342,51 @@ namespace LlamaApp.Views
         {
             var byRepo = await GetCatalogByRepoAsync();
 
+            // Preserve rows with an in-flight app-driven download. A populate can
+            // race a just-started download (ReconcileAsync triggers a full reload
+            // when the list was momentarily empty, e.g. right after a delete, and
+            // it completes after the download's row was added). Clearing such a
+            // row would orphan its driver (progress + cancel/pause) and the fresh
+            // row would render the ring's pause button disabled — which is also
+            // what painted a lighter disk behind the ring. Matched by repo (the
+            // server may id a mid-download model by its bare repo, quant-less).
+            var inFlight = _localByServerId.Values
+                .Where(m => m.DownloadCancellation is not null)
+                .Distinct()
+                .ToList();
+            var reused = new HashSet<ModelItem>();
+
             LocalModels.Clear();
             _localByServerId.Clear();
             foreach (var sm in serverModels)
             {
-                var item = BuildLocalItem(sm, byRepo);
+                var repo = SplitServerId(sm.Id).repo;
+                var existing = inFlight.FirstOrDefault(m =>
+                    !reused.Contains(m) &&
+                    string.Equals(SplitServerId(((IModel)m).ServerModelId).repo, repo,
+                        StringComparison.OrdinalIgnoreCase));
+                ModelItem item;
+                if (existing is not null)
+                {
+                    reused.Add(existing);
+                    existing.IsLoaded = sm.IsLoaded;
+                    existing.IsDownloading = sm.IsDownloading;
+                    item = existing;
+                }
+                else
+                {
+                    item = BuildLocalItem(sm, byRepo);
+                }
                 _localByServerId[sm.Id] = item;
                 LocalModels.Add(item);
+            }
+
+            // In-flight downloads the server hasn't listed yet (just POSTed) —
+            // keep their rows too so the driver isn't orphaned.
+            foreach (var m in inFlight.Where(m => !reused.Contains(m)))
+            {
+                _localByServerId[((IModel)m).ServerModelId] = m;
+                LocalModels.Add(m);
             }
 
             UpdateEmptyState();
@@ -1495,12 +1533,18 @@ namespace LlamaApp.Views
         /// True when this exact build (repo + quant) is already installed —
         /// the variant row then reads "Installed" instead of offering a
         /// duplicate download. Same id forms the installed rows are keyed by
-        /// (repo:quant; the server reports a bare repo mid-download).
+        /// (repo:quant; the server reports a bare repo mid-download). The
+        /// repo-level fallback only counts a row whose quant matches the
+        /// variant's — otherwise downloading one quant (say Q4_0) would mark
+        /// every sibling quant of the family (Q8_0, …) as installed too.
         /// </summary>
         bool IModelFamilyDetailsHost.IsVariantInstalled(ModelFamily family, ModelFamilySize size, ModelFamilyBuild build)
         {
             var serverId = build.Repo + ":" + build.Quant;
-            return _localByServerId.ContainsKey(serverId) || FindLocalByRepo(serverId) is not null;
+            if (_localByServerId.ContainsKey(serverId)) return true;
+            var row = FindLocalByRepo(serverId);
+            return row is not null &&
+                   string.Equals(row.Quant, build.Quant, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -2201,13 +2245,13 @@ namespace LlamaApp.Views
             if (_externalDownloadWatches.ContainsKey(item))
                 return;
 
-            // Mid-download the server ids the model by its bare repo, which is
-            // also what the SSE "model" field carries.
-            var repo = SplitServerId(serverId).repo;
+            // Pass the full server id (repo or repo:quant, however the server
+            // keys the download) — the watcher matches SSE events on the repo
+            // part, so both key forms resolve to the same download.
             var cts = new CancellationTokenSource();
             _externalDownloadWatches[item] = cts;
-            Log.Info("watching external download: " + repo);
-            _ = WatchExternalDownloadAsync(item, repo, cts);
+            Log.Info("watching external download: " + serverId);
+            _ = WatchExternalDownloadAsync(item, serverId, cts);
         }
 
         /// <summary>
@@ -2221,7 +2265,7 @@ namespace LlamaApp.Views
                 cts.Cancel();
         }
 
-        private async Task WatchExternalDownloadAsync(ModelItem item, string repo, CancellationTokenSource cts)
+        private async Task WatchExternalDownloadAsync(ModelItem item, string serverId, CancellationTokenSource cts)
         {
             long lastApplyMs = 0;
             long lastSampleBytes = 0, lastSampleMs = 0;
@@ -2260,12 +2304,12 @@ namespace LlamaApp.Views
 
             try
             {
-                await LlamaManager.Shared.WatchDownloadAsync(repo, progress, cts.Token);
+                await LlamaManager.Shared.WatchDownloadAsync(serverId, progress, cts.Token);
             }
             catch (Exception ex)
             {
                 // Fire-and-forget: nothing upstream would observe a fault.
-                Log.Warn(ex, "external download watch faulted: " + repo);
+                Log.Warn(ex, "external download watch faulted: " + serverId);
             }
 
             // The entry may already be gone — or replaced by a newer watch — if
@@ -2278,20 +2322,36 @@ namespace LlamaApp.Views
 
         /// <summary>
         /// Finds an Available row by bare repo id (the part of a server model id
-        /// before <c>:</c>). The server ids a mid-download model by its bare repo
-        /// — the quant is resolved only once the download completes — so an exact
-        /// <see cref="_localByServerId"/> lookup misses rows that were keyed
-        /// <c>repo:quant</c> (e.g. moved from Recommended on tap).
+        /// before <c>:</c>). Older servers id a mid-download model by its bare
+        /// repo (the quant resolves only once the download completes), so an
+        /// exact <see cref="_localByServerId"/> lookup can miss rows that were
+        /// keyed <c>repo:quant</c> (e.g. moved from Recommended on tap).
+        ///
+        /// <para>When several rows share the repo (multiple quants installed),
+        /// an exact quant match wins; a bare-repo id (mid-download) prefers a
+        /// row that is itself mid-download, so the transient id never steals
+        /// another quant's key and duplicates the model in the list.</para>
         /// </summary>
         private ModelItem? FindLocalByRepo(string serverId)
         {
-            var (repo, _) = SplitServerId(serverId);
+            var (repo, quant) = SplitServerId(serverId);
+            ModelItem? fallback = null;
             foreach (var (key, row) in _localByServerId)
             {
-                if (string.Equals(SplitServerId(key).repo, repo, StringComparison.OrdinalIgnoreCase))
+                var (rowRepo, rowQuant) = SplitServerId(key);
+                if (!string.Equals(rowRepo, repo, StringComparison.OrdinalIgnoreCase)) continue;
+
+                // Both ids carry a quant and they agree — exact hit.
+                if (quant.Length > 0 && rowQuant.Length > 0 &&
+                    string.Equals(rowQuant, quant, StringComparison.OrdinalIgnoreCase))
                     return row;
+
+                // Bare-repo ids belong to the download in flight.
+                if (quant.Length == 0 && row.IsDownloading) return row;
+
+                fallback ??= row;
             }
-            return null;
+            return fallback;
         }
 
         /// <summary>
