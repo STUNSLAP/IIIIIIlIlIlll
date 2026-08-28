@@ -156,11 +156,13 @@
                                  names is what made it feel random). -->
                             <Border CornerRadius="{ThemeResource ControlCornerRadius}"
                                     Background="{ThemeResource ControlFillColorSecondaryBrush}"
-                                    Padding="4,1"
+                                    Padding="4,0"
+                                    Height="16"
                                     VerticalAlignment="Center"
                                     Visibility="{x:Bind Model.HasQuant}">
                                 <TextBlock Text="{x:Bind Model.Quant}"
                                            FontSize="10"
+                                           VerticalAlignment="Center"
                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                             </Border>
                             <!-- Vision marker: shown when the server reports
@@ -184,11 +186,12 @@
                                  (View) exists in both. -->
                             <Border CornerRadius="{ThemeResource ControlCornerRadius}"
                                     Background="{ThemeResource ControlFillColorSecondaryBrush}"
-                                    Padding="4,1"
+                                    Padding="4,0"
+                                    Height="16"
                                     VerticalAlignment="Center"
                                     Visibility="{x:Bind Model.Vision, Mode=OneWay}">
                                 <FontIcon Glyph="&#xE890;"
-                                          FontSize="10"
+                                          FontSize="11"
                                           Opacity="0.55"
                                           HorizontalAlignment="Center"
                                           VerticalAlignment="Center" />
