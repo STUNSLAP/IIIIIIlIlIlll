@@ -85,6 +85,14 @@ namespace LlamaApp.Views
         /// <summary>The catalog's featured model families (browse section).</summary>
         public ObservableCollection<ModelFamilyViewModel> Families { get; } = [];
 
+        /// <summary>
+        /// The rows of the bottom Hub-search section: the results of the most
+        /// recent Hugging Face query (empty until the first search). Cleared
+        /// and repopulated per search; row state ("added" checkmark) flows
+        /// through bindings.
+        /// </summary>
+        public ObservableCollection<HubModelItemViewModel> HubResults { get; } = [];
+
         // Wrapper cache: an installed row keeps the same list-item view-model
         // across unrelated rebuilds, so the ListView's realized containers
         // (and scroll position) survive membership churn.
@@ -130,6 +138,31 @@ namespace LlamaApp.Views
         // watch's lifetime: started when a row enters the downloading state,
         // canceled when it leaves it. All access happens on the UI thread.
         private readonly Dictionary<ModelItem, CancellationTokenSource> _externalDownloadWatches = new();
+
+        // Hub-search bookkeeping. _hubSearchId makes stale search responses
+        // (an earlier query landing after a newer one) discardable; _hubSuggestId
+        // does the same for the AutoSuggestBox's per-keystroke suggestions;
+        // _hubDownloads links each Hub row to the ModelItem its download click
+        // created, so a canceled first-download can re-enable the row's button.
+        private int _hubSearchId;
+        private int _hubSuggestId;
+
+        // Per-attempt cancellation for the two hub-request paths. Each new
+        // keystroke/search cancels the previous in-flight request's token so
+        // superseded requests (up to 10 s) stop consuming sockets. The id
+        // counters above remain the correctness mechanism for staleness;
+        // cancellation is an additive optimization. Cancel-and-replace without
+        // disposing (matching StopExternalDownloadWatch's convention) — the
+        // token is already captured by the in-flight request. UI-thread-only.
+        private CancellationTokenSource? _hubSuggestCts;
+        private CancellationTokenSource? _hubSearchCts;
+
+        // The query whose results HubResults currently holds — the load-more
+        // page fetch uses it (NOT HubSearchBox.Text, which a picked suggestion
+        // rewrites). Page fetches share _hubSearchId / _hubSearchCts with the
+        // full search, so a newer search or page fetch supersedes the old one.
+        private string? _hubPagedQuery;
+        private readonly Dictionary<HubModelItemViewModel, ModelItem> _hubDownloads = new();
 
         // Last observed server state, for the once-per-transition crash toast
         // in LlamaManager_StateChanged (StateChanged fires for every manager
@@ -190,6 +223,7 @@ namespace LlamaApp.Views
             {
                 RebuildItems();
                 RebuildBrowseTail();
+                UpdateHubRowStates();
             };
 
             LoadModels();
@@ -379,6 +413,13 @@ namespace LlamaApp.Views
                 }
                 _localByServerId[sm.Id] = item;
                 LocalModels.Add(item);
+
+                // Rows the brand-logo mapping can't fill (Hub-downloaded
+                // models have no catalog brand) fall back to the author's
+                // Hub avatar — disk first, then a fetch on miss (per-author
+                // coalesced and globally bounded; see AttachCachedItemAvatarAsync).
+                if (item.Logo is null)
+                    _ = AttachCachedItemAvatarAsync(item);
             }
 
             // In-flight downloads the server hasn't listed yet (just POSTed) —
@@ -901,10 +942,42 @@ namespace LlamaApp.Views
             // server to abort the download when the token fires.
             using var cts = new CancellationTokenSource();
             item.DownloadCancellation = cts;
+
+            // Progress toast: replaces itself in place under this tag, so a
+            // long download streams its percent without flooding Action
+            // Center. Shown only while the flyout is hidden (when it's visible
+            // the row's ring tells the story) — the throttled progress
+            // callback below toggles it either way as the flyout comes and
+            // goes. Closed on every terminal path so no ghost toast
+            // outlives the download.
+            var toastTag = "download:" + ((IModel)item).ServerModelId;
+            var toastShown = false;
+            var cancelToastAction = new ToastAction("Cancel",
+                ("action", "cancelDownload"), ("id", ((IModel)item).ServerModelId));
+            void UpdateProgressToast(double fraction, string status)
+            {
+                if (IsFlyoutVisible)
+                {
+                    if (toastShown)
+                    {
+                        toastShown = false;
+                        Notifications.Close(toastTag);
+                    }
+                }
+                else
+                {
+                    toastShown = true;
+                    Notifications.ShowProgress(toastTag,
+                        "Downloading " + item.DisplayName, status, fraction, cancelToastAction);
+                }
+            }
             // Reset any stale detail from a previous (failed or paused) attempt
             // — the subtitle shows the live detail line as soon as a size is
             // known. Fresh SSE progress events repopulate the byte counts.
             item.DownloadPaused = false;
+            // Clear any stale failure (and its classified detail) from a
+            // previous failed attempt — a new download starts clean.
+            item.DownloadFailed = false;
             item.DownloadedBytes = 0;
             item.DownloadTotalBytes = 0;
             item.DownloadBytesPerSecond = 0;
@@ -915,19 +988,42 @@ namespace LlamaApp.Views
             // ~10 updates/sec. Terminal events (Done/Failed) always pass through
             // so the final state lands immediately.
             long lastProgressApplyMs = 0;
+            // The toast updates even less often: ~1/sec is plenty for a
+            // progress bar, and every update is a notification-platform call.
+            long lastToastUpdateMs = 0;
             long lastSampleBytes = 0, lastSampleMs = 0;
             double bytesPerSecond = 0;
             string? serverMessage = null;
+            int? serverHttpStatus = null;
+            string? serverExceptionType = null;
             var progress = new Progress<ModelDownloadProgress>(p =>
             {
                 var now = Environment.TickCount64;
                 if (!p.Done && !p.Failed && now - lastProgressApplyMs < 100) return;
                 lastProgressApplyMs = now;
 
+                // Progress toast, on its own ~1/sec throttle (a toast update is
+                // a notification-platform call — far pricier than a UI-thread
+                // Apply). Runs on the UI thread like the rest of this callback.
+                if (!p.Done && !p.Failed && now - lastToastUpdateMs >= 1000)
+                {
+                    lastToastUpdateMs = now;
+                    if (p.TotalBytes > 0)
+                        UpdateProgressToast(p.Fraction,
+                            DownloadToastStatus(p.Fraction, bytesPerSecond));
+                }
+
                 // The server's rejection detail (POST error body, stream
-                // failure) — surfaced in the failure toast.
-                if (p.Failed && !string.IsNullOrWhiteSpace(p.Message))
-                    serverMessage = p.Message;
+                // failure) plus the optional classification inputs (HTTP status
+                // / exception type) — surfaced in the failure toast and
+                // classified for the row + toast.
+                if (p.Failed)
+                {
+                    if (!string.IsNullOrWhiteSpace(p.Message))
+                        serverMessage = p.Message;
+                    serverHttpStatus = p.HttpStatus;
+                    serverExceptionType = p.ExceptionType;
+                }
 
                 // Speed estimate between applied samples (EMA-smoothed — the
                 // per-chunk instantaneous rate jitters too much to show raw).
@@ -965,6 +1061,7 @@ namespace LlamaApp.Views
                 var ok = await mgr.DownloadModelAsync(item, progress, cts.Token);
                 void Complete()
                 {
+                    if (toastShown) { toastShown = false; Notifications.Close(toastTag); }
                     item.IsDownloading = false;
                     // A pause click that raced the completion is discarded —
                     // the download is over, there is nothing left to resume.
@@ -983,9 +1080,22 @@ namespace LlamaApp.Views
                     }
                     else
                     {
+                        // Classify the failure (HTTP status / SSE error text /
+                        // exception type) into actionable guidance while
+                        // preserving the raw detail on the row + log. The toast
+                        // still carries a Retry button that routes straight
+                        // back into the row's retry path (App handles the
+                        // activation) — the user never has to reopen the flyout
+                        // to start the download over.
+                        var failure = DownloadFailurePresentation.Classify(
+                            serverHttpStatus, serverMessage, serverExceptionType);
+                        item.DownloadFailureInfo = failure;
                         item.DownloadFailed = true;
                         NotifyWhenHidden("Download failed",
-                            DownloadFailureToastBody(item, serverMessage));
+                            DownloadFailurePresentation.ToastBody(item.DisplayName, failure),
+                            new ToastAction("Retry",
+                                ("action", "retryDownload"),
+                                ("id", ((IModel)item).ServerModelId)));
                     }
                 }
                 if (queue is null || queue.HasThreadAccess)
@@ -1007,6 +1117,7 @@ namespace LlamaApp.Views
                 // the next attempt starts the download over.
                 void Abort()
                 {
+                    if (toastShown) { toastShown = false; Notifications.Close(toastTag); }
                     if (item is { PendingFirstDownload: true, DownloadPaused: false })
                         RemovePendingDownloadRow(item);
                     else
@@ -1017,15 +1128,31 @@ namespace LlamaApp.Views
                 else
                     queue.TryEnqueue(Abort);
             }
-            catch
+            catch (Exception ex)
             {
+                // A throw from the stream open / mid-loop (transport fault,
+                // unparseable event) rather than a clean Failed report. Log it
+                // (this path had no message or log before) and classify from
+                // the captured server evidence when present, else from the
+                // exception itself so the row + toast still explain something.
+                Log.Error(ex, $"download for {((IModel)item).ServerModelId} failed unexpectedly");
+                var failureHttpStatus = serverMessage is not null ? serverHttpStatus : null;
+                var failureDetail = serverMessage ?? ex.Message;
+                var failureExceptionType = serverMessage is not null ? serverExceptionType : ex.GetType().Name;
                 void Fail()
                 {
+                    if (toastShown) { toastShown = false; Notifications.Close(toastTag); }
                     item.IsDownloading = false;
                     item.DownloadPaused = false;
+                    var failure = DownloadFailurePresentation.Classify(
+                        failureHttpStatus, failureDetail, failureExceptionType);
+                    item.DownloadFailureInfo = failure;
                     item.DownloadFailed = true;
                     NotifyWhenHidden("Download failed",
-                        DownloadFailureToastBody(item, serverMessage));
+                        DownloadFailurePresentation.ToastBody(item.DisplayName, failure),
+                        new ToastAction("Retry",
+                            ("action", "retryDownload"),
+                            ("id", ((IModel)item).ServerModelId)));
                 }
                 if (queue is null || queue.HasThreadAccess)
                     Fail();
@@ -1041,21 +1168,16 @@ namespace LlamaApp.Views
         }
 
         /// <summary>
-        /// Builds the download-failure toast body, appending the server's
-        /// rejection detail when one was reported (truncated so a JSON error
-        /// body doesn't flood the toast).
+        /// The progress toast's status line — percent + smoothed speed, e.g.
+        /// "42% · 12.3 MB/s". A stalled stream shows just the percent, never a
+        /// bogus "0 B/s".
         /// </summary>
-        private static string DownloadFailureToastBody(ModelItem item, string? serverMessage)
+        private static string DownloadToastStatus(double fraction, double bytesPerSecond)
         {
-            var detail = "";
-            if (!string.IsNullOrWhiteSpace(serverMessage))
-            {
-                var trimmed = serverMessage.Length > 140
-                    ? serverMessage[..140] + "…"
-                    : serverMessage;
-                detail = $" Server said: {trimmed}.";
-            }
-            return $"{item.DisplayName} couldn't be downloaded.{detail} Click retry to try again.";
+            var pct = (int)Math.Round(fraction * 100);
+            return bytesPerSecond > 0
+                ? $"{pct}% · {DownloadProgressPresentation.FormatBytes(bytesPerSecond)}/s"
+                : $"{pct}%";
         }
 
         // ---- Model load → open ----
@@ -1157,8 +1279,35 @@ namespace LlamaApp.Views
             }
 
             Log.Info("cancel clicked: cancelling download of " + ((IModel)item).ServerModelId);
+
+            // Ask the server to abort the transfer first — the cancellation
+            // below only closes this app's SSE watcher, and the poller would
+            // otherwise keep the row alive (resurrected from the server
+            // snapshot, ring and all) until the server finished downloading.
+            _ = LlamaManager.Shared.CancelServerDownloadAsync(((IModel)item).ServerModelId);
+
             try { item.DownloadCancellation?.Cancel(); }
             catch (ObjectDisposedException) { /* download finished between check and click */ }
+
+            // Tear the row down immediately rather than waiting for the
+            // driver's cancellation unwind (its SSE read can sit on a canceled
+            // token until the stream next yields, leaving the ring up and the
+            // row in the installed list). Same cleanup the driver's Abort()
+            // path performs — idempotent with it.
+            if (item.PendingFirstDownload)
+            {
+                RemovePendingDownloadRow(item);
+            }
+            else
+            {
+                // An installed model's re-download keeps its row (the file is
+                // on disk) — reset it to the play glyph.
+                item.IsDownloading = false;
+                item.DownloadFraction = 0;
+                item.DownloadedBytes = 0;
+                item.DownloadTotalBytes = 0;
+                item.DownloadBytesPerSecond = 0;
+            }
         }
 
         /// <summary>
@@ -1187,6 +1336,7 @@ namespace LlamaApp.Views
             item.DownloadTotalBytes = 0;
             item.DownloadBytesPerSecond = 0;
             item.Downloadable = true;
+            item.PendingFirstDownload = false;
 
             UpdateEmptyState();
         }
@@ -1258,6 +1408,51 @@ namespace LlamaApp.Views
             item.DownloadFailed = false;
             item.IsDownloading = true;
             _ = DownloadAndLaunchAsync(item);
+        }
+
+        // ---- Toast action routing ----
+
+        /// <summary>
+        /// Resolves a model row from a toast action's id and mirrors the row
+        /// retry glyph's behavior (see <see cref="LocalModelRetryDownload_Click"/>).
+        /// Called by App when the user taps Retry on a download-failed toast;
+        /// a stale toast (row gone, or already retrying/downloading) is a
+        /// no-op — the toast may outlive the state it was shown for.
+        /// </summary>
+        public void RetryDownloadFromToast(string? serverModelId)
+        {
+            var item = FindRowByServerId(serverModelId);
+            if (item is null) return;
+            if (item.IsDownloading || !item.DownloadFailed) return;
+
+            Log.Info("retry clicked (toast): re-downloading " + serverModelId);
+            item.DownloadFailed = false;
+            item.IsDownloading = true;
+            _ = DownloadAndLaunchAsync(item);
+        }
+
+        /// <summary>
+        /// Cancels a running download from its progress toast's Cancel button.
+        /// Same cancellation source as the row's own cancel button, so the
+        /// abort path (SSE close + server-side abort) is identical.
+        /// </summary>
+        public void CancelDownloadFromToast(string? serverModelId)
+        {
+            var item = FindRowByServerId(serverModelId);
+            if (item?.DownloadCancellation is { } cts) cts.Cancel();
+        }
+
+        private ModelItem? FindRowByServerId(string? serverModelId)
+        {
+            if (serverModelId is null)
+            {
+                Log.Warn("toast action carried no model id");
+                return null;
+            }
+            var item = LocalModels.FirstOrDefault(m => ((IModel)m).ServerModelId == serverModelId);
+            if (item is null)
+                Log.Warn("toast action: no row for " + serverModelId);
+            return item;
         }
 
         /// <summary>
@@ -1653,6 +1848,16 @@ namespace LlamaApp.Views
         {
             if (!IsFlyoutVisible)
                 Notifications.Show(title, body);
+        }
+
+        /// <summary>
+        /// <see cref="NotifyWhenHidden(string, string)"/> with action buttons
+        /// (e.g. Retry on a download-failure toast).
+        /// </summary>
+        private void NotifyWhenHidden(string title, string body, params ToastAction[] actions)
+        {
+            if (!IsFlyoutVisible)
+                Notifications.Show(title, body, actions);
         }
 
         // ---- Row hover feedback ----
@@ -2138,8 +2343,12 @@ namespace LlamaApp.Views
                         if (!item.IsLoaded)
                         {
                             Log.Info("model loaded: " + sm.Id);
+                            // The Chat button jumps straight to the overlay —
+                            // the reason the model was loaded in the first
+                            // place — instead of just opening the flyout.
                             NotifyWhenHidden("Model ready",
-                                $"{item.DisplayName} is loaded and ready to chat.");
+                                $"{item.DisplayName} is loaded and ready to chat.",
+                                new ToastAction("Chat", ("action", "chat")));
                         }
                         item.IsLoaded = true;
                         item.IsLoading = false;
@@ -2200,6 +2409,10 @@ namespace LlamaApp.Views
                         newItem.PendingFirstDownload = true;
                     _localByServerId[sm.Id] = newItem;
                     LocalModels.Add(newItem);
+                    // Disk first, Hub fetch on miss (per-author coalesced and
+                    // globally bounded; see AttachCachedItemAvatarAsync).
+                    if (newItem.Logo is null)
+                        _ = AttachCachedItemAvatarAsync(newItem);
                     Log.Info("added new local row from poller: " + sm.Id);
                 }
             }
@@ -2404,10 +2617,16 @@ namespace LlamaApp.Views
         }
 
         private void Settings_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+            => OpenSettings();
+
+        /// <summary>
+        /// Opens the Settings window (shared by the flyout's gear and the tray
+        /// context menu). Hides the flyout first so the settings dialog isn't
+        /// drawn behind it (the flyout would otherwise immediately deactivate
+        /// and hide on its own, but doing it explicitly avoids a flash).
+        /// </summary>
+        public void OpenSettings()
         {
-            // Hide the flyout first so the settings dialog isn't drawn behind it
-            // (the flyout would otherwise immediately deactivate and hide on its
-            // own, but doing it explicitly avoids a flash).
             HideFlyout();
 
             var w = new SettingsWindow();
@@ -2467,6 +2686,414 @@ namespace LlamaApp.Views
         {
             if (_avatarProfileUrl is null) return;
             await Windows.System.Launcher.LaunchUriAsync(new Uri(_avatarProfileUrl));
+        }
+
+        // ---- Hub search (bottom section) ----
+
+        /// <summary>
+        /// Drives the Hub search box's suggestions while the user types:
+        /// debounced (one Hub request per settled keystroke burst, stale
+        /// responses discarded by id) top-GGUF-repo matches, ranked by
+        /// downloads. Enter, a picked suggestion, or the magnifier runs the
+        /// full search via <see cref="HubSearchBox_QuerySubmitted"/>.
+        /// </summary>
+        private async void HubSearchBox_TextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+        {
+            if (args.Reason != AutoSuggestionBoxTextChangeReason.UserInput) return;
+            var query = sender.Text?.Trim() ?? "";
+            if (query.Length == 0)
+            {
+                sender.ItemsSource = null;
+                return;
+            }
+
+            var suggestId = ++_hubSuggestId;
+            _hubSuggestCts?.Cancel();
+            _hubSuggestCts = new CancellationTokenSource();
+            var cancel = _hubSuggestCts.Token;
+            try { await Task.Delay(300, cancel); }
+            catch (OperationCanceledException) { return; }
+            if (suggestId != _hubSuggestId) return; // a newer keystroke superseded us
+
+            try
+            {
+                var token = Settings.Current.HuggingFaceToken;
+                var results = await new HubClient(string.IsNullOrWhiteSpace(token) ? null : token)
+                    .SearchModels(query, cancel, limit: 6);
+                if (suggestId != _hubSuggestId) return;
+                // Suggestions are ranked by likes (most-liked first) — the
+                // dropdown's pick list, unlike the full search beneath (which
+                // keeps the Hub's download ranking). Ties fall back to the
+                // Hub's download order (OrderByDescending is stable).
+                //
+                // The list is then REVERSED: the search box sits at the
+                // window's bottom edge, so the suggestion popup opens upward
+                // and anchors the FIRST ItemsSource item nearest the query
+                // box — without the reversal the most-liked suggestion would
+                // sit at the bottom of the dropdown (observed: the exact
+                // reverse of the sorted list rendered, twice, across
+                // restarts). Reversing keeps most-liked at the visual top.
+                sender.ItemsSource = ToHubRows(results)
+                    .OrderByDescending(r => r.Likes)
+                    .Take(6)
+                    .Reverse()
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                // Offline / rejected — suggestions are a best-effort affordance;
+                // the full search's status line carries the error if one runs.
+                Log.Debug("hub suggestions failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Runs the full Hub search: Enter in the box, the magnifier, or a
+        /// picked suggestion (whose repo id fills the box via
+        /// TextMemberPath). The chosen suggestion is the authoritative query —
+        /// its repo id replaces whatever partial text is in the box.
+        /// </summary>
+        private void HubSearchBox_QuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
+        {
+            var query = args.ChosenSuggestion is HubModelItemViewModel vm
+                ? vm.RepoId
+                : args.QueryText?.Trim();
+            if (string.IsNullOrWhiteSpace(query)) return;
+
+            if (!string.Equals(HubSearchBox.Text, query, StringComparison.Ordinal))
+                HubSearchBox.Text = query; // programmatic — TextChanged ignores it
+            _ = RunHubSearchAsync();
+        }
+
+        /// <summary>
+        /// Queries the Hugging Face Hub for GGUF models matching the search
+        /// box's text and fills <see cref="HubResults"/>. The status line
+        /// above the results mirrors the browse section's (ring while in
+        /// flight, a count / no-results / error caption). Stale responses —
+        /// an earlier query landing after a newer one was started — are
+        /// discarded by id, so rapid Enter presses never interleave results.
+        /// </summary>
+        private async Task RunHubSearchAsync()
+        {
+            var query = HubSearchBox.Text?.Trim() ?? "";
+            if (query.Length == 0) return;
+
+            var searchId = ++_hubSearchId;
+            _hubSearchCts?.Cancel();
+            _hubSearchCts = new CancellationTokenSource();
+            var cancel = _hubSearchCts.Token;
+            HubResultsPanel.Visibility = Visibility.Visible;
+            HubResultsList.Visibility = Visibility.Collapsed;
+            HubStatusRing.Visibility = Visibility.Visible;
+            HubStatusText.Text = $"Searching Hugging Face for \u201C{query}\u201D\u2026";
+
+            // The token is optional for search (it only lifts rate limits and
+            // unlocks gated repos) — read it before the try so the catch
+            // clauses can gate token-specific guidance on it.
+            var token = Settings.Current.HuggingFaceToken;
+            var tokenConfigured = !string.IsNullOrWhiteSpace(token);
+
+            try
+            {
+                var results = await new HubClient(string.IsNullOrWhiteSpace(token) ? null : token)
+                    .SearchModels(query, cancel);
+
+                if (searchId != _hubSearchId) return; // a newer search superseded us
+
+                HubResults.Clear();
+                foreach (var row in ToHubRows(results))
+                {
+                    HubResults.Add(row);
+                    // Disk cache only — a full page of results must never
+                    // fire a request storm; the fetch happens at download
+                    // time (AttachItemAvatarAsync) and every later search
+                    // shows the author immediately.
+                    _ = AttachHubAvatarAsync(row);
+                }
+                UpdateHubRowStates();
+
+                _hubPagedQuery = query;
+                // A full page means there may be more — append the single
+                // load-more sentinel. The status line keeps the page-1 count
+                // after appends (mid-list appends don't rewrite it; the count
+                // wording is frozen for a separate status-message task).
+                if (HubSearchPagination.PossiblyHasNextPage(results.Count, HubClient.DefaultSearchLimit))
+                    HubResults.Add(NewHubLoadMoreRow());
+
+                HubStatusRing.Visibility = Visibility.Collapsed;
+                HubResultsList.Visibility = results.Count > 0
+                    ? Visibility.Visible : Visibility.Collapsed;
+                HubStatusText.Text = results.Count == 0
+                    ? HubSearchFailurePresentation.NoResultsCaption(query)
+                    : $"{results.Count} GGUF repos for \u201C{query}\u201D";
+            }
+            catch (HubSearchException ex)
+            {
+                // The Hub answered with a non-success status (429 rate limit,
+                // 401/403 auth, …) — classify it into actionable guidance.
+                if (searchId != _hubSearchId) return;
+                var failure = HubSearchFailurePresentation.Classify(ex, tokenConfigured);
+                // Rate-limit/auth failures carry actionable guidance and are
+                // logged at debug; a typed status that still lands in Unknown
+                // (e.g. 5xx, anonymous 401/403) must leave a Warn-level trace
+                // like the generic catch below.
+                if (failure.Kind == HubSearchFailureKind.Unknown)
+                    Log.Warn(ex, "hub search failed");
+                else
+                    Log.Debug($"hub search rejected: HTTP {ex.Status}");
+                HubStatusRing.Visibility = Visibility.Collapsed;
+                HubResultsList.Visibility = Visibility.Collapsed;
+                HubStatusText.Text = HubSearchFailurePresentation.StatusText(failure);
+            }
+            catch (Exception ex) when (ex is HttpRequestException
+                or TaskCanceledException or TimeoutException)
+            {
+                // Network failure / timeout — say so instead of "no results".
+                if (searchId != _hubSearchId) return;
+                HubStatusRing.Visibility = Visibility.Collapsed;
+                HubResultsList.Visibility = Visibility.Collapsed;
+                HubStatusText.Text =
+                    "Couldn't reach Hugging Face. Check your connection and try again.";
+            }
+            catch (Exception ex)
+            {
+                if (searchId != _hubSearchId) return;
+                Log.Warn(ex, "hub search failed");
+                HubStatusRing.Visibility = Visibility.Collapsed;
+                HubResultsList.Visibility = Visibility.Collapsed;
+                HubStatusText.Text = "Search failed. Try again.";
+            }
+        }
+
+        /// <summary>
+        /// Fired by the load-more row: fetches the next page of the current
+        /// query (skip = number of real result rows already shown) and appends
+        /// it in place. Shares the full search's id/CTS bookkeeping, so a newer
+        /// search or page fetch supersedes this one; a failure flips the row to
+        /// a recoverable "Retry" and never touches the shown results.
+        /// </summary>
+        private async void HubLoadMore_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not FrameworkElement fe || fe.Tag is not HubModelItemViewModel vm)
+                return;
+            if (!vm.IsLoadMoreRow || vm.LoadMoreBusy) return; // guard double-fetch
+            var query = _hubPagedQuery;
+            if (string.IsNullOrWhiteSpace(query)) return;
+
+            var searchId = ++_hubSearchId;
+            _hubSearchCts?.Cancel();
+            _hubSearchCts = new CancellationTokenSource();
+            var cancel = _hubSearchCts.Token;
+
+            // Busy flips synchronously before the first await; skip counts the
+            // REAL result rows (the sentinel excluded), captured pre-await so a
+            // concurrent change can't shift the offset.
+            vm.LoadMoreBusy = true;
+            vm.LoadMoreFailed = false;
+            var skip = HubSearchPagination.NextSkip(CountHubResultRows(HubResults));
+
+            try
+            {
+                // The token is optional for search — pass it when configured.
+                var token = Settings.Current.HuggingFaceToken;
+                var results = await new HubClient(string.IsNullOrWhiteSpace(token) ? null : token)
+                    .SearchModels(query, cancel, skip: skip);
+
+                if (searchId != _hubSearchId) return; // superseded by a newer search/page fetch
+
+                // Append in place — never Clear: the already-shown rows (and
+                // their avatars/download state) must survive a page fetch.
+                HubResults.Remove(vm);
+                foreach (var row in ToHubRows(results))
+                {
+                    HubResults.Add(row);
+                    _ = AttachHubAvatarAsync(row);
+                }
+                UpdateHubRowStates();
+
+                // A full page means there may be more; a short/empty page ends
+                // the list — the affordance is not reattached.
+                if (HubSearchPagination.PossiblyHasNextPage(results.Count, HubClient.DefaultSearchLimit))
+                    HubResults.Add(NewHubLoadMoreRow());
+            }
+            catch (Exception ex) when (ex is HttpRequestException
+                or TaskCanceledException or TimeoutException)
+            {
+                // Superseded (id changed / token canceled) is not a failure —
+                // only a real network error flips the row to Retry. The shown
+                // results are never touched.
+                if (searchId != _hubSearchId) return;
+                if (cancel.IsCancellationRequested) return;
+                vm.LoadMoreBusy = false;
+                vm.LoadMoreFailed = true;
+            }
+            catch (Exception ex)
+            {
+                if (searchId != _hubSearchId) return;
+                if (cancel.IsCancellationRequested) return;
+                Log.Warn(ex, "hub load more failed");
+                vm.LoadMoreBusy = false;
+                vm.LoadMoreFailed = true;
+            }
+        }
+
+        /// <summary>Creates the synthetic "Show more" row appended after a full page.</summary>
+        private static HubModelItemViewModel NewHubLoadMoreRow() => new() { IsLoadMoreRow = true };
+
+        /// <summary>
+        /// The number of REAL result rows in the list — the load-more sentinel
+        /// is excluded, so this is both the offset the next page is fetched at
+        /// and the "shown so far" count. Shared with the pagination tests.
+        /// </summary>
+        internal static int CountHubResultRows(IReadOnlyList<HubModelItemViewModel> rows)
+        {
+            var count = 0;
+            foreach (var row in rows)
+            {
+                if (!row.IsLoadMoreRow) count++;
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// Maps Hub search results onto the row view-models the results list
+        /// and the AutoSuggestBox dropdown both render: the repo id split
+        /// into its display name (last path segment) and author (first).
+        /// </summary>
+        private static List<HubModelItemViewModel> ToHubRows(List<HubClient.HubSearchResult> results)
+        {
+            var rows = new List<HubModelItemViewModel>(results.Count);
+            foreach (var r in results)
+            {
+                var sep = r.Id.LastIndexOf('/');
+                rows.Add(new HubModelItemViewModel
+                {
+                    RepoId = r.Id,
+                    DisplayName = sep >= 0 ? r.Id[(sep + 1)..] : r.Id,
+                    Author = sep > 0 ? r.Id[..sep] : "",
+                    Downloads = r.Downloads,
+                    Likes = r.Likes,
+                    LastModified = r.LastModified,
+                });
+            }
+            return rows;
+        }
+
+        /// <summary>
+        /// Attaches the author's Hub avatar to a search-result row once it
+        /// lands — disk cache only, so populating a full page of results
+        /// never fires a request storm. Authors seen before (their model was
+        /// downloaded) show their avatar immediately; the fetch happens at
+        /// download time (<see cref="AttachItemAvatarAsync"/>).
+        /// </summary>
+        private async Task AttachHubAvatarAsync(HubModelItemViewModel row)
+        {
+            var avatar = await AvatarCache.GetAsync(row.Author);
+            if (avatar is not null && HubResults.Contains(row))
+                row.Logo = avatar;
+        }
+
+        /// <summary>
+        /// Attaches the author's Hub avatar to an installed-list row once it
+        /// lands — fetching it from the Hub on first use and storing it under
+        /// the app's local cache for reuse (<see cref="AvatarCache"/>).
+        /// Avatars are decorative: a failure just leaves the empty tile.
+        /// </summary>
+        private async Task AttachItemAvatarAsync(ModelItem item)
+        {
+            var avatar = await AvatarCache.GetOrFetchAsync(AuthorOf(item.RepoName ?? item.Name));
+            if (avatar is not null) item.Logo = avatar;
+        }
+
+        /// <summary>
+        /// Attaches a Hub avatar to a row the brand-logo mapping can't fill —
+        /// disk cache first, fetching from the Hub on miss and storing it for
+        /// reuse. Fetches are coalesced per author and globally bounded by
+        /// <see cref="AvatarCache"/>, so filling the installed list doesn't
+        /// storm the Hub. Decorative: a failure just leaves the empty tile.
+        /// </summary>
+        private async Task AttachCachedItemAvatarAsync(ModelItem item)
+        {
+            var avatar = await AvatarCache.GetOrFetchAsync(AuthorOf(item.RepoName ?? item.Name));
+            if (avatar is not null) item.Logo = avatar;
+        }
+
+        /// <summary>The author/org part of a repo id ("" when there is none).</summary>
+        private static string AuthorOf(string repoId)
+        {
+            var sep = repoId.LastIndexOf('/');
+            return sep > 0 ? repoId[..sep] : "";
+        }
+
+        /// <summary>
+        /// Fired by a Hub search-result row's download button: builds a
+        /// <see cref="ModelItem"/> for the repo and hands it to the shared
+        /// download pipeline (<see cref="StartRecommendedDownloadAsync"/>) —
+        /// the same disk-space/memory preflights, progress ring, cancel/pause
+        /// affordances and post-download auto-load as a catalog download.
+        /// The row carries the bare repo id (no quant suffix): the running
+        /// server resolves its own default GGUF variant, the same rule
+        /// <see cref="LlamaManager.DownloadModelAsync"/> documents for
+        /// quant-less ids. The live progress shows on the model's row in the
+        /// installed list; this row flips to a static checkmark.
+        /// </summary>
+        private void HubModelDownload_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not FrameworkElement fe || fe.Tag is not HubModelItemViewModel vm)
+                return;
+            if (vm.DownloadStarted) return; // already downloading / installed
+            if (vm.IsLoadMoreRow) return; // the synthetic row has no repo to download
+
+            var item = new ModelItem
+            {
+                Name = vm.DisplayName,
+                RepoName = vm.RepoId,
+                Description = "",
+                Parameters = "",
+                Size = "",
+                License = "",
+                Vision = false,
+                Downloadable = true,
+                Brand = vm.Author,
+            };
+            vm.DownloadStarted = true;
+            _hubDownloads[vm] = item;
+            _ = StartRecommendedDownloadAsync(item, fe);
+
+            // Fetch + store the author's Hub avatar (disk-cached for reuse)
+            // and attach it to the row when it lands — ModelItem.Logo
+            // notifies, so the installed list's tile updates live.
+            _ = AttachItemAvatarAsync(item);
+        }
+
+        /// <summary>
+        /// Re-syncs the Hub rows' "added" state with the installed list: a row
+        /// whose repo is already installed keeps its checkmark; one whose
+        /// first-download was canceled before anything landed (its row was
+        /// removed from the installed list) offers the download again. Runs on
+        /// the UI thread (the LocalModels.CollectionChanged hook and the
+        /// search completion both call it).
+        /// </summary>
+        private void UpdateHubRowStates()
+        {
+            var installed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var m in LocalModels)
+                installed.Add(m.RepoName ?? m.Name);
+
+            foreach (var vm in HubResults)
+            {
+                if (vm.IsLoadMoreRow) continue; // synthetic row — no repo state
+                var started = installed.Contains(vm.RepoId);
+                if (!started &&
+                    _hubDownloads.TryGetValue(vm, out var item) &&
+                    !item.IsDownloading)
+                {
+                    // The download click's row is gone from the installed list
+                    // and nothing is in flight — a canceled first-download.
+                    _hubDownloads.Remove(vm);
+                }
+                vm.DownloadStarted = started || _hubDownloads.ContainsKey(vm);
+            }
         }
 
         private void Quit_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)

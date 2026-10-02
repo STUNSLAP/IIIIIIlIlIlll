@@ -9,6 +9,7 @@ namespace LlamaApp
         private TrayIconManager? _trayIcon;
         private OverlayWindow? _overlay;
         private GlobalHotkey? _hotkey;
+        private Llama.RuntimeUpdateScheduler? _runtimeUpdates;
 
         /// <summary>
         /// Initializes the singleton application object.  This is the first line of authored code
@@ -105,7 +106,7 @@ namespace LlamaApp
             // failed) while the flyout is hidden. Clicking a toast re-opens the
             // flyout; so does a redirected second-launch activation.
             Notifications.Initialize();
-            Notifications.Invoked += () => _dispatcher.TryEnqueue(() => _trayIcon?.ShowFlyout());
+            Notifications.Invoked += args => _dispatcher.TryEnqueue(() => HandleToastActivation(args));
             instance.Activated += (_, _) => _dispatcher.TryEnqueue(() => _trayIcon?.ShowFlyout());
 
             // Ensure a llama.cpp server is reachable on the configured port:
@@ -123,7 +124,22 @@ namespace LlamaApp
             Common.Log.Info($"cache directory: {Settings.Current.CacheDirectory}");
             // Presence only — never log the token itself.
             Common.Log.Info($"HF token: {(string.IsNullOrWhiteSpace(Settings.Current.HuggingFaceToken) ? "not set" : "configured")}");
-            _ = Llama.LlamaManager.Shared.EnsureLlamaOrDownloadAsync();
+            // Weekly runtime self-update: when the last check (persisted under
+            // %LOCALAPPDATA%\Llama) is a week old or older, check llama.cpp's
+            // latest release and install it via install.ps1 BEFORE the server
+            // launches — the one point where llama.exe is not in use. The
+            // scheduler then runs the ensure and keeps an hourly watch; it
+            // defers installs while the server is up. Fire-and-forget like
+            // the ensure it wraps.
+            _runtimeUpdates = new Llama.RuntimeUpdateScheduler(Llama.LlamaManager.Shared);
+            // The weekly pass is silent — but a successful install deserves a
+            // toast (it explains why the server takes a moment longer the
+            // next time it starts, and why the version footer changed).
+            _runtimeUpdates.RuntimeUpdated += build => _dispatcher.TryEnqueue(() =>
+                Notifications.Show("llama.cpp updated",
+                    $"The llama.cpp runtime was updated to b{build}. The new version is used the next time the server starts."));
+            _ = _runtimeUpdates.StartAsync(
+                () => Llama.LlamaManager.Shared.EnsureLlamaOrDownloadAsync());
 
             // Spotlight-style prompt overlay, summoned by a global Alt+Space
             // hotkey. Created lazily on first press and reused thereafter; the
@@ -152,6 +168,48 @@ namespace LlamaApp
                 Notifications.Show("Llama is running",
                     "Find it in the system tray — and press Alt+Space anytime to chat with a loaded model.");
             }
+        }
+
+        /// <summary>
+        /// The app-wide runtime update scheduler (created in OnLaunched) —
+        /// Settings uses it for the Check-for-updates card.
+        /// </summary>
+        internal Llama.RuntimeUpdateScheduler RuntimeUpdates => _runtimeUpdates!;
+
+        /// <summary>
+        /// Opens the chat overlay — the Alt+Space panel — from surfaces that
+        /// don't own the hotkey (toast Chat button, tray context menu).
+        /// </summary>
+        internal void SummonChatOverlay() => _overlay?.Summon();
+
+        /// <summary>
+        /// Responds to a toast activation on the UI thread: a body click keeps
+        /// the long-standing behavior (open the flyout); an action button's
+        /// arguments name the response — retry/cancel a download by model
+        /// id (the MainWindow resolves the row), or open the chat overlay.
+        /// Unknown arguments fall back to the flyout rather than doing
+        /// nothing — a stale toast from a previous version should still go
+        /// somewhere useful.
+        /// </summary>
+        private void HandleToastActivation(IReadOnlyDictionary<string, string> args)
+        {
+            if (args.TryGetValue("action", out var action))
+            {
+                args.TryGetValue("id", out var id);
+                switch (action)
+                {
+                    case "chat":
+                        _overlay?.Summon();
+                        return;
+                    case "retryDownload":
+                        _window?.RetryDownloadFromToast(id);
+                        return;
+                    case "cancelDownload":
+                        _window?.CancelDownloadFromToast(id);
+                        return;
+                }
+            }
+            _trayIcon?.ShowFlyout();
         }
     }
 }
